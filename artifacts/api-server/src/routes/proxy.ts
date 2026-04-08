@@ -2,6 +2,7 @@ import { Router } from "express";
 import OpenAI from "openai";
 import Anthropic from "@anthropic-ai/sdk";
 import type { Request, Response } from "express";
+import { logger } from "../lib/logger";
 
 const router = Router();
 
@@ -66,9 +67,10 @@ function flush(res: Response) {
   (res as unknown as { flush?: () => void }).flush?.();
 }
 
-/** Send JSON error only if headers haven't been sent. */
-function sendError(res: Response, status: number, message: string, type = "api_error") {
+/** Send JSON error only if headers haven't been sent. Logs every error for debugging. */
+function sendError(res: Response, status: number, message: string, type = "api_error", context?: Record<string, unknown>) {
   if (res.headersSent) return;
+  logger.error({ status, type, ...context }, `proxy error: ${message}`);
   res.status(status).json({ error: { message, type, code: status } });
 }
 
@@ -302,9 +304,11 @@ router.post("/chat/completions", async (req: Request, res: Response) => {
   delete (rest as Record<string, unknown>).model;
 
   if (!model) {
-    sendError(res, 400, "model is required", "invalid_request_error");
+    sendError(res, 400, "model is required", "invalid_request_error", { rawModel: body.model });
     return;
   }
+
+  logger.info({ model, stream: body.stream, endpoint: "chat/completions" }, "proxy request");
 
   // ── OpenAI path ──────────────────────────────────────────────────────────
   if (isOpenAIModel(model)) {
@@ -465,7 +469,7 @@ router.post("/chat/completions", async (req: Request, res: Response) => {
     return;
   }
 
-  sendError(res, 400, `Unknown model: ${model}. Supported: ${ALL_MODELS.map((m) => m.id).join(", ")}`, "invalid_request_error");
+  sendError(res, 400, `Unknown model: ${model}. Supported: ${ALL_MODELS.map((m) => m.id).join(", ")}`, "invalid_request_error", { model });
 });
 
 // ── POST /v1/messages (Anthropic native) ─────────────────────────────────────
@@ -489,9 +493,11 @@ router.post("/messages", async (req: Request, res: Response) => {
   delete (rest as Record<string, unknown>).model;
 
   if (!model) {
-    sendError(res, 400, "model is required", "invalid_request_error");
+    sendError(res, 400, "model is required", "invalid_request_error", { rawModel: body.model });
     return;
   }
+
+  logger.info({ model, stream: body.stream, endpoint: "messages" }, "proxy request");
 
   // ── Claude model — forward to Anthropic ──────────────────────────────────
   if (isAnthropicModel(model)) {
@@ -528,7 +534,8 @@ router.post("/messages", async (req: Request, res: Response) => {
           flush(res);
         }
       } catch (err) {
-        const e = err as { message?: string };
+        const e = err as { status?: number; message?: string; error?: unknown };
+        logger.error({ model, status: e.status, upstream: e.error ?? e.message }, "anthropic stream error");
         if (!res.writableEnded) {
           try { res.write(`event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "api_error", message: e.message ?? "Stream error" } })}\n\n`); } catch { /* ignore */ }
         }
@@ -545,8 +552,8 @@ router.post("/messages", async (req: Request, res: Response) => {
       ).finalMessage();
       res.json(msg);
     } catch (err) {
-      const e = err as { status?: number; message?: string };
-      sendError(res, e.status ?? 500, e.message ?? "Anthropic error");
+      const e = err as { status?: number; message?: string; error?: unknown };
+      sendError(res, e.status ?? 500, e.message ?? "Anthropic error", "api_error", { model, upstream: e.error ?? e.message });
     }
     return;
   }
@@ -758,7 +765,7 @@ router.post("/messages", async (req: Request, res: Response) => {
     return;
   }
 
-  sendError(res, 400, `Unknown model: ${model}. Supported: ${ALL_MODELS.map((m) => m.id).join(", ")}`, "invalid_request_error");
+  sendError(res, 400, `Unknown model: ${model}. Supported: ${ALL_MODELS.map((m) => m.id).join(", ")}`, "invalid_request_error", { model });
 });
 
 export default router;
