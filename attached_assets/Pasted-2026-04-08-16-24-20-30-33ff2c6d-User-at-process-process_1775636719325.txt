@@ -1,0 +1,152 @@
+2026-04-08 16:24:20.30
+33ff2c6d
+User
+at process.processTicksAndRejections (node:internal/process/task_queues:103:5)
+2026-04-08 16:24:20.30
+33ff2c6d
+User
+Error [ERR_HTTP_HEADERS_SENT]: Cannot set headers after they are sent to the client
+2026-04-08 16:24:20.30
+33ff2c6d
+User
+at ServerResponse.setHeader (node:_http_outgoing:642:11)
+2026-04-08 16:24:20.30
+33ff2c6d
+User
+at ServerResponse.json (/home/runner/workspace/node_modules/.pnpm/express@5.2.1/node_modules/express/lib/response.js:252:15)
+2026-04-08 16:24:20.30
+33ff2c6d
+User
+at ServerResponse.send2 (/home/runner/workspace/node_modules/.pnpm/express@5.2.1/node_modules/express/lib/response.js:163:12)
+2026-04-08 16:24:20.30
+33ff2c6d
+User
+at <anonymous> (/home/runner/workspace/artifacts/api-server/src/routes/proxy.ts:389:33)
+2026-04-08 16:24:20.30
+33ff2c6d
+User
+at ServerResponse.header (/home/runner/workspace/node_modules/.pnpm/express@5.2.1/node_modules/express/lib/response.js:686:10)
+2026-04-08 16:24:20.30
+33ff2c6d
+User
+at ServerResponse.header (/home/runner/workspace/node_modules/.pnpm/express@5.2.1/node_modules/express/lib/response.js:686:10)
+2026-04-08 16:24:20.30
+33ff2c6d
+User
+at <anonymous> (/home/runner/workspace/artifacts/api-server/src/routes/proxy.ts:389:33)
+2026-04-08 16:24:20.30
+33ff2c6d
+User
+at ServerResponse.send2 (/home/runner/workspace/node_modules/.pnpm/express@5.2.1/node_modules/express/lib/response.js:163:12)
+2026-04-08 16:24:20.30
+33ff2c6d
+User
+at ServerResponse.json (/home/runner/workspace/node_modules/.pnpm/express@5.2.1/node_modules/express/lib/response.js:252:15)
+2026-04-08 16:24:20.30
+33ff2c6d
+User
+at ServerResponse.setHeader (node:_http_outgoing:642:11)
+2026-04-08 16:24:20.30
+33ff2c6d
+User
+Error [ERR_HTTP_HEADERS_SENT]: Cannot set headers after they are sent to the client
+2026-04-08 16:24:20.30
+33ff2c6d
+User
+at process.processTicksAndRejections (node:internal/process/task_queues:103:5)
+2026-04-08 16:24:51.31
+33ff2c6d
+User
+at ServerResponse.setHeader (node:_http_outgoing:642:11)
+2026-04-08 16:24:51.31
+33ff2c6d
+User
+at ServerResponse.header (/home/runner/workspace/node_modules/.pnpm/express@5.2.1/node_modules/express/lib/response.js:686:10)
+2026-04-08 16:24:51.31
+33ff2c6d
+User
+at ServerResponse.json (/home/runner/workspace/node_modules/.pnpm/express@5.2.1/node_modules/express/lib/response.js:252:15)
+2026-04-08 16:24:51.31
+33ff2c6d
+User
+{"level":30,"time":1775636691311,"pid":19,"hostname":"localhost","req":{"id":40,"method":"POST","url":"/v1/chat/completions"},"res":{"statusCode":400},"responseTime":443,"msg":"request completed"}
+2026-04-08 16:24:51.31
+33ff2c6d
+User
+at ServerResponse.send2 (/home/runner/workspace/node_modules/.pnpm/express@5.2.1/node_modules/express/lib/response.js:163:12)
+2026-04-08 16:24:51.31
+33ff2c6d
+User
+at process.processTicksAndRejections (node:internal/process/task_queues:103:5)
+2026-04-08 16:24:51.31
+33ff2c6d
+User
+at <anonymous> (/home/runner/workspace/artifacts/api-server/src/routes/proxy.ts:389:33)
+2026-04-08 16:24:51.31
+33ff2c6d
+User
+Error [ERR_HTTP_HEADERS_SENT]: Cannot set headers after they are sent to the client
+2026-04-08 16:24:51.31
+33ff2c6d
+User
+at ServerResponse.setHeader (node:_http_outgoing:642:11)
+2026-04-08 16:24:51.31
+33ff2c6d
+User
+at ServerResponse.header (/home/runner/workspace/node_modules/.pnpm/express@5.2.1/node_modules/express/lib/response.js:686:10)
+2026-04-08 16:24:51.31
+33ff2c6d
+User
+at ServerResponse.json (/home/runner/workspace/node_modules/.pnpm/express@5.2.1/node_modules/express/lib/response.js:252:15)
+2026-04-08 16:24:51.31
+33ff2c6d
+User
+{"level":30,"time":1775636691311,"pid":19,"hostname":"localhost","req":{"id":40,"method":"POST","url":"/v1/chat/completions"},"res":{"statusCode":400},"responseTime":443,"msg":"request completed"}
+2026-04-08 16:24:51.31
+33ff2c6d
+User
+at ServerResponse.send2 (/home/runner/workspace/node_modules/.pnpm/express@5.2.1/node_modules/express/lib/response.js:163:12)
+2026-04-08 16:24:51.31
+33ff2c6d
+User
+at process.processTicksAndRejections (node:internal/process/task_queues:103:5)
+2026-04-08 16:24:51.31
+33ff2c6d
+User
+at <anonymous> (/home/runner/workspace/artifacts/api-server/src/routes/proxy.ts:389:33)
+2026-04-08 16:24:51.31
+33ff2c6d
+User
+Error [ERR_HTTP_HEADERS_SENT]: Cannot set headers after they are sent to the client
+2026-04-08 16:24:51.31
+33ff2c6d
+User
+at ServerResponse.setHeader (node:_http_outgoing:642:11)
+2026-04-08 16:24:51.31
+33ff2c6d
+User
+at ServerResponse.header (/home/runner/workspace/node_modules/.pnpm/express@5.2.1/node_modules/express/lib/response.js:686:10)
+2026-04-08 16:24:51.31
+33ff2c6d
+User
+at ServerResponse.json (/home/runner/workspace/node_modules/.pnpm/express@5.2.1/node_modules/express/lib/response.js:252:15)
+2026-04-08 16:24:51.31
+33ff2c6d
+User
+{"level":30,"time":1775636691311,"pid":19,"hostname":"localhost","req":{"id":40,"method":"POST","url":"/v1/chat/completions"},"res":{"statusCode":400},"responseTime":443,"msg":"request completed"}
+2026-04-08 16:24:51.31
+33ff2c6d
+User
+at ServerResponse.send2 (/home/runner/workspace/node_modules/.pnpm/express@5.2.1/node_modules/express/lib/response.js:163:12)
+2026-04-08 16:24:51.31
+33ff2c6d
+User
+at process.processTicksAndRejections (node:internal/process/task_queues:103:5)
+2026-04-08 16:24:51.31
+33ff2c6d
+User
+at <anonymous> (/home/runner/workspace/artifacts/api-server/src/routes/proxy.ts:389:33)
+2026-04-08 16:24:51.31
+33ff2c6d
+User
+Error [ERR_HTTP_HEADERS_SENT]: Cannot set headers after they are sent to the client

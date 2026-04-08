@@ -41,12 +41,44 @@ function verifyBearer(req: Request, res: Response): boolean {
   return true;
 }
 
+/**
+ * Strip provider prefix from model names.
+ * e.g. "replit/claude-sonnet-4-6" → "claude-sonnet-4-6"
+ *      "openai/gpt-5.2"          → "gpt-5.2"
+ */
+function normalizeModel(model: string): string {
+  const slash = model.indexOf("/");
+  return slash >= 0 ? model.slice(slash + 1) : model;
+}
+
 function isOpenAIModel(model: string): boolean {
   return model.startsWith("gpt-") || model.startsWith("o");
 }
 
 function isAnthropicModel(model: string): boolean {
   return model.startsWith("claude-");
+}
+
+/** Send a JSON error only if headers haven't been sent yet. */
+function sendError(res: Response, status: number, message: string, type = "api_error") {
+  if (res.headersSent) return;
+  res.status(status).json({ error: { message, type, code: status } });
+}
+
+/** Write an SSE error event when we are already streaming. */
+function writeStreamError(res: Response, message: string) {
+  try {
+    const errChunk = {
+      id: `chatcmpl-err-${Date.now()}`,
+      object: "chat.completion.chunk",
+      created: Math.floor(Date.now() / 1000),
+      model: "",
+      choices: [{ index: 0, delta: {}, finish_reason: "stop", logprobs: null }],
+      error: { message, type: "api_error" },
+    };
+    res.write(`data: ${JSON.stringify(errChunk)}\n\n`);
+    res.write("data: [DONE]\n\n");
+  } catch { /* ignore write errors on a closed socket */ }
 }
 
 // ── Tool format converters ───────────────────────────────────────────────────
@@ -136,7 +168,10 @@ function oaiMessagesToAnthropic(messages: OAIMessage[]): {
           contentBlocks.push({ type: "tool_use", id: tc.id, name: tc.function.name, input });
         }
       }
-      result.push({ role: "assistant", content: contentBlocks.length === 1 && !msg.tool_calls ? contentBlocks[0] : contentBlocks });
+      result.push({
+        role: "assistant",
+        content: contentBlocks.length === 1 && !msg.tool_calls ? contentBlocks[0] : contentBlocks,
+      });
       continue;
     }
 
@@ -206,8 +241,16 @@ function anthropicToOAIResponse(msg: AnthropicFinalMessage, requestedModel: stri
     created: Math.floor(Date.now() / 1000),
     model: requestedModel,
     choices: [{ index: 0, message, finish_reason: finishReason, logprobs: null }],
-    usage: { prompt_tokens: msg.usage.input_tokens, completion_tokens: msg.usage.output_tokens, total_tokens: msg.usage.input_tokens + msg.usage.output_tokens },
+    usage: {
+      prompt_tokens: msg.usage.input_tokens,
+      completion_tokens: msg.usage.output_tokens,
+      total_tokens: msg.usage.input_tokens + msg.usage.output_tokens,
+    },
   };
+}
+
+function flush(res: Response) {
+  (res as unknown as { flush?: () => void }).flush?.();
 }
 
 // ── GET /v1/models ───────────────────────────────────────────────────────────
@@ -240,17 +283,23 @@ router.post("/chat/completions", async (req: Request, res: Response) => {
     [key: string]: unknown;
   };
 
-  const { model, messages, stream, tools, tool_choice, ...rest } = body;
+  // Normalize model name — strip provider prefix (e.g. "replit/claude-sonnet-4-6")
+  const rawModel = body.model;
+  const model = normalizeModel(rawModel ?? "");
+  const { messages, stream, tools, tool_choice, ...rest } = body;
+  delete (rest as Record<string, unknown>).model;
 
   if (!model) {
-    res.status(400).json({ error: { message: "model is required", type: "invalid_request_error" } });
+    sendError(res, 400, "model is required", "invalid_request_error");
     return;
   }
+
+  let streamStarted = false;
 
   try {
     // ── OpenAI path ──────────────────────────────────────────────────────────
     if (isOpenAIModel(model)) {
-      const params: Record<string, unknown> = { model, messages, stream: stream ?? false, ...rest };
+      const params: Record<string, unknown> = { model, messages, ...rest };
       if (tools) params.tools = tools;
       if (tool_choice) params.tool_choice = tool_choice;
 
@@ -260,16 +309,21 @@ router.post("/chat/completions", async (req: Request, res: Response) => {
         res.setHeader("Connection", "keep-alive");
         res.setHeader("X-Accel-Buffering", "no");
         res.flushHeaders();
+        streamStarted = true;
 
         const keepalive = setInterval(() => {
           try { res.write(": keepalive\n\n"); } catch { /* ignore */ }
         }, 5000);
 
         try {
-          const oaiStream = await openai.chat.completions.create({ ...params, stream: true } as Parameters<typeof openai.chat.completions.create>[0]);
+          const oaiStream = await openai.chat.completions.create({
+            ...params,
+            stream: true,
+          } as Parameters<typeof openai.chat.completions.create>[0]);
+
           for await (const chunk of oaiStream) {
             res.write(`data: ${JSON.stringify(chunk)}\n\n`);
-            (res as unknown as { flush?: () => void }).flush?.();
+            flush(res);
           }
           res.write("data: [DONE]\n\n");
         } finally {
@@ -279,7 +333,10 @@ router.post("/chat/completions", async (req: Request, res: Response) => {
         return;
       }
 
-      const response = await openai.chat.completions.create(params as Parameters<typeof openai.chat.completions.create>[0]);
+      const response = await openai.chat.completions.create({
+        ...params,
+        stream: false,
+      } as Parameters<typeof openai.chat.completions.create>[0]);
       res.json(response);
       return;
     }
@@ -302,6 +359,7 @@ router.post("/chat/completions", async (req: Request, res: Response) => {
         res.setHeader("Connection", "keep-alive");
         res.setHeader("X-Accel-Buffering", "no");
         res.flushHeaders();
+        streamStarted = true;
 
         const keepalive = setInterval(() => {
           try { res.write(": keepalive\n\n"); } catch { /* ignore */ }
@@ -313,7 +371,8 @@ router.post("/chat/completions", async (req: Request, res: Response) => {
           let currentToolId = "";
           let currentToolName = "";
           let toolIndex = -1;
-          let contentIndex = 0;
+          let blockIdx = -1;
+          let hasText = false;
           const chatId = `chatcmpl-${Date.now()}`;
 
           const sendChunk = (delta: Record<string, unknown>, finishReason: string | null = null) => {
@@ -325,12 +384,15 @@ router.post("/chat/completions", async (req: Request, res: Response) => {
               choices: [{ index: 0, delta, finish_reason: finishReason, logprobs: null }],
             };
             res.write(`data: ${JSON.stringify(chunk)}\n\n`);
-            (res as unknown as { flush?: () => void }).flush?.();
+            flush(res);
           };
 
+          // Send the initial role chunk so clients know content is coming
           sendChunk({ role: "assistant", content: "" });
 
-          const anthropicStream = anthropic.messages.stream(anthropicParams as Parameters<typeof anthropic.messages.stream>[0]);
+          const anthropicStream = anthropic.messages.stream(
+            anthropicParams as Parameters<typeof anthropic.messages.stream>[0],
+          );
 
           for await (const event of anthropicStream) {
             const e = event as Record<string, unknown>;
@@ -339,9 +401,11 @@ router.post("/chat/completions", async (req: Request, res: Response) => {
             if (type === "content_block_start") {
               const block = e.content_block as { type: string; id?: string; name?: string };
               if (block.type === "text") {
-                contentIndex++;
+                blockIdx++;
+                hasText = true;
               } else if (block.type === "tool_use") {
                 toolIndex++;
+                blockIdx++;
                 currentToolId = block.id ?? "";
                 currentToolName = block.name ?? "";
                 sendChunk({
@@ -358,7 +422,9 @@ router.post("/chat/completions", async (req: Request, res: Response) => {
               if (delta.type === "text_delta" && delta.text) {
                 sendChunk({ content: delta.text });
               } else if (delta.type === "input_json_delta" && delta.partial_json !== undefined) {
-                sendChunk({ tool_calls: [{ index: toolIndex, function: { arguments: delta.partial_json } }] });
+                sendChunk({
+                  tool_calls: [{ index: toolIndex, function: { arguments: delta.partial_json } }],
+                });
               }
             } else if (type === "message_delta") {
               const d = e.delta as { stop_reason?: string };
@@ -369,6 +435,8 @@ router.post("/chat/completions", async (req: Request, res: Response) => {
             }
           }
 
+          void hasText; void currentToolId; void currentToolName; void blockIdx;
+
           res.write("data: [DONE]\n\n");
         } finally {
           clearInterval(keepalive);
@@ -377,16 +445,23 @@ router.post("/chat/completions", async (req: Request, res: Response) => {
         return;
       }
 
-      // Non-stream Anthropic — always use stream internally to avoid timeout
-      const finalMsg = await anthropic.messages.stream(anthropicParams as Parameters<typeof anthropic.messages.stream>[0]).finalMessage();
+      // Non-stream: always buffer internally via stream to avoid upstream timeouts
+      const finalMsg = await anthropic.messages.stream(
+        anthropicParams as Parameters<typeof anthropic.messages.stream>[0],
+      ).finalMessage();
       res.json(anthropicToOAIResponse(finalMsg as AnthropicFinalMessage, model));
       return;
     }
 
-    res.status(400).json({ error: { message: `Unknown model: ${model}`, type: "invalid_request_error" } });
+    sendError(res, 400, `Unknown model: ${model}. Supported: ${ALL_MODELS.map((m) => m.id).join(", ")}`, "invalid_request_error");
   } catch (err: unknown) {
     const e = err as { status?: number; message?: string };
-    res.status(e.status ?? 500).json({ error: { message: e.message ?? "Internal server error", type: "api_error" } });
+    if (streamStarted) {
+      writeStreamError(res, e.message ?? "Internal server error");
+      res.end();
+    } else {
+      sendError(res, e.status ?? 500, e.message ?? "Internal server error");
+    }
   }
 });
 
@@ -406,17 +481,28 @@ router.post("/messages", async (req: Request, res: Response) => {
     [key: string]: unknown;
   };
 
-  const { model, messages, system, tools, tool_choice, max_tokens, stream, ...rest } = body;
+  // Normalize model name
+  const rawModel = body.model;
+  const model = normalizeModel(rawModel ?? "");
+  const { messages, system, tools, tool_choice, max_tokens, stream, ...rest } = body;
+  delete (rest as Record<string, unknown>).model;
 
   if (!model) {
-    res.status(400).json({ error: { type: "invalid_request_error", message: "model is required" } });
+    sendError(res, 400, "model is required", "invalid_request_error");
     return;
   }
+
+  let streamStarted = false;
 
   try {
     // ── Claude model — forward to Anthropic ──────────────────────────────────
     if (isAnthropicModel(model)) {
-      const params: Record<string, unknown> = { model, messages, max_tokens: max_tokens ?? 8192, ...rest };
+      const params: Record<string, unknown> = {
+        model,
+        messages,
+        max_tokens: max_tokens ?? 8192,
+        ...rest,
+      };
       if (system) params.system = system;
       if (tools) params.tools = tools;
       if (tool_choice) params.tool_choice = tool_choice;
@@ -427,6 +513,7 @@ router.post("/messages", async (req: Request, res: Response) => {
         res.setHeader("Connection", "keep-alive");
         res.setHeader("X-Accel-Buffering", "no");
         res.flushHeaders();
+        streamStarted = true;
 
         const keepalive = setInterval(() => {
           try { res.write(": keepalive\n\n"); } catch { /* ignore */ }
@@ -434,10 +521,13 @@ router.post("/messages", async (req: Request, res: Response) => {
         req.on("close", () => clearInterval(keepalive));
 
         try {
-          const anthropicStream = anthropic.messages.stream(params as Parameters<typeof anthropic.messages.stream>[0]);
+          const anthropicStream = anthropic.messages.stream(
+            params as Parameters<typeof anthropic.messages.stream>[0],
+          );
           for await (const event of anthropicStream) {
-            res.write(`event: ${(event as { type: string }).type}\ndata: ${JSON.stringify(event)}\n\n`);
-            (res as unknown as { flush?: () => void }).flush?.();
+            const e = event as { type: string };
+            res.write(`event: ${e.type}\ndata: ${JSON.stringify(event)}\n\n`);
+            flush(res);
           }
         } finally {
           clearInterval(keepalive);
@@ -446,14 +536,15 @@ router.post("/messages", async (req: Request, res: Response) => {
         return;
       }
 
-      const msg = await anthropic.messages.stream(params as Parameters<typeof anthropic.messages.stream>[0]).finalMessage();
+      const msg = await anthropic.messages.stream(
+        params as Parameters<typeof anthropic.messages.stream>[0],
+      ).finalMessage();
       res.json(msg);
       return;
     }
 
     // ── OpenAI model — convert Anthropic → OAI → back ───────────────────────
     if (isOpenAIModel(model)) {
-      // Convert Anthropic messages format to OAI messages
       const oaiMessages: OAIMessage[] = [];
       if (system) oaiMessages.push({ role: "system", content: system });
 
@@ -506,6 +597,7 @@ router.post("/messages", async (req: Request, res: Response) => {
         res.setHeader("Connection", "keep-alive");
         res.setHeader("X-Accel-Buffering", "no");
         res.flushHeaders();
+        streamStarted = true;
 
         const keepalive = setInterval(() => {
           try { res.write(": keepalive\n\n"); } catch { /* ignore */ }
@@ -513,20 +605,31 @@ router.post("/messages", async (req: Request, res: Response) => {
         req.on("close", () => clearInterval(keepalive));
 
         const msgId = `msg_${Date.now()}`;
-        let inputTokens = 0;
         let outputTokens = 0;
 
         const sendEvent = (type: string, data: unknown) => {
           res.write(`event: ${type}\ndata: ${JSON.stringify(data)}\n\n`);
-          (res as unknown as { flush?: () => void }).flush?.();
+          flush(res);
         };
 
         try {
-          const oaiStream = await openai.chat.completions.create({ ...oaiParams, stream: true } as Parameters<typeof openai.chat.completions.create>[0]);
+          const oaiStream = await openai.chat.completions.create({
+            ...oaiParams,
+            stream: true,
+          } as Parameters<typeof openai.chat.completions.create>[0]);
 
           sendEvent("message_start", {
             type: "message_start",
-            message: { id: msgId, type: "message", role: "assistant", model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 0, output_tokens: 0 } },
+            message: {
+              id: msgId,
+              type: "message",
+              role: "assistant",
+              model,
+              content: [],
+              stop_reason: null,
+              stop_sequence: null,
+              usage: { input_tokens: 0, output_tokens: 0 },
+            },
           });
 
           let textBlockIdx = -1;
@@ -543,10 +646,18 @@ router.post("/messages", async (req: Request, res: Response) => {
                 hasText = true;
                 blockIdx++;
                 textBlockIdx = blockIdx;
-                sendEvent("content_block_start", { type: "content_block_start", index: textBlockIdx, content_block: { type: "text", text: "" } });
+                sendEvent("content_block_start", {
+                  type: "content_block_start",
+                  index: textBlockIdx,
+                  content_block: { type: "text", text: "" },
+                });
                 sendEvent("ping", { type: "ping" });
               }
-              sendEvent("content_block_delta", { type: "content_block_delta", index: textBlockIdx, delta: { type: "text_delta", text: delta.content } });
+              sendEvent("content_block_delta", {
+                type: "content_block_delta",
+                index: textBlockIdx,
+                delta: { type: "text_delta", text: delta.content },
+              });
               outputTokens++;
             }
 
@@ -562,7 +673,9 @@ router.post("/messages", async (req: Request, res: Response) => {
                     content_block: { type: "tool_use", id: tcId, name: tc.function?.name ?? "", input: {} },
                   });
                 }
-                const idx = tc.id ? toolBlockIndices[tc.id] : Object.values(toolBlockIndices).at(-1) ?? blockIdx;
+                const idx = tc.id
+                  ? toolBlockIndices[tc.id]
+                  : Object.values(toolBlockIndices).at(-1) ?? blockIdx;
                 if (tc.function?.arguments) {
                   sendEvent("content_block_delta", {
                     type: "content_block_delta",
@@ -574,12 +687,12 @@ router.post("/messages", async (req: Request, res: Response) => {
             }
 
             if (chunk.choices[0]?.finish_reason) {
-              if (hasText) sendEvent("content_block_stop", { type: "content_block_stop", index: textBlockIdx });
-              for (const [id, i] of Object.entries(toolBlockIndices)) {
-                void id;
+              if (hasText) {
+                sendEvent("content_block_stop", { type: "content_block_stop", index: textBlockIdx });
+              }
+              for (const [, i] of Object.entries(toolBlockIndices)) {
                 sendEvent("content_block_stop", { type: "content_block_stop", index: i });
               }
-
               const stopReason = chunk.choices[0].finish_reason === "tool_calls" ? "tool_use" : "end_turn";
               sendEvent("message_delta", {
                 type: "message_delta",
@@ -590,10 +703,11 @@ router.post("/messages", async (req: Request, res: Response) => {
             }
 
             if (chunk.usage) {
-              inputTokens = chunk.usage.prompt_tokens ?? 0;
               outputTokens = chunk.usage.completion_tokens ?? 0;
             }
           }
+
+          void hasText;
         } finally {
           clearInterval(keepalive);
           res.end();
@@ -601,8 +715,10 @@ router.post("/messages", async (req: Request, res: Response) => {
         return;
       }
 
-      // Non-stream OAI path
-      const oaiResponse = await openai.chat.completions.create(oaiParams as Parameters<typeof openai.chat.completions.create>[0]);
+      // Non-stream OAI
+      const oaiResponse = await openai.chat.completions.create(
+        oaiParams as Parameters<typeof openai.chat.completions.create>[0],
+      );
       const choice = oaiResponse.choices[0];
       const contentBlocks: unknown[] = [];
       if (choice?.message?.content) {
@@ -616,7 +732,7 @@ router.post("/messages", async (req: Request, res: Response) => {
         }
       }
       const stopReason = choice?.finish_reason === "tool_calls" ? "tool_use" : "end_turn";
-      const anthropicResponse = {
+      res.json({
         id: `msg_${oaiResponse.id}`,
         type: "message",
         role: "assistant",
@@ -628,15 +744,19 @@ router.post("/messages", async (req: Request, res: Response) => {
           input_tokens: oaiResponse.usage?.prompt_tokens ?? 0,
           output_tokens: oaiResponse.usage?.completion_tokens ?? 0,
         },
-      };
-      res.json(anthropicResponse);
+      });
       return;
     }
 
-    res.status(400).json({ error: { type: "invalid_request_error", message: `Unknown model: ${model}` } });
+    sendError(res, 400, `Unknown model: ${model}. Supported: ${ALL_MODELS.map((m) => m.id).join(", ")}`, "invalid_request_error");
   } catch (err: unknown) {
     const e = err as { status?: number; message?: string };
-    res.status(e.status ?? 500).json({ error: { type: "api_error", message: e.message ?? "Internal server error" } });
+    if (streamStarted) {
+      writeStreamError(res, e.message ?? "Internal server error");
+      res.end();
+    } else {
+      sendError(res, e.status ?? 500, e.message ?? "Internal server error");
+    }
   }
 });
 
