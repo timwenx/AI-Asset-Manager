@@ -41,11 +41,7 @@ function verifyBearer(req: Request, res: Response): boolean {
   return true;
 }
 
-/**
- * Strip provider prefix from model names.
- * e.g. "replit/claude-sonnet-4-6" → "claude-sonnet-4-6"
- *      "openai/gpt-5.2"          → "gpt-5.2"
- */
+/** Strip provider prefix: "replit/claude-sonnet-4-6" → "claude-sonnet-4-6" */
 function normalizeModel(model: string): string {
   const slash = model.indexOf("/");
   return slash >= 0 ? model.slice(slash + 1) : model;
@@ -59,16 +55,24 @@ function isAnthropicModel(model: string): boolean {
   return model.startsWith("claude-");
 }
 
-/** Send a JSON error only if headers haven't been sent yet. */
+function flush(res: Response) {
+  (res as unknown as { flush?: () => void }).flush?.();
+}
+
+/** Send JSON error only if headers haven't been sent. */
 function sendError(res: Response, status: number, message: string, type = "api_error") {
   if (res.headersSent) return;
   res.status(status).json({ error: { message, type, code: status } });
 }
 
-/** Write an SSE error event when we are already streaming. */
+/**
+ * Safely write an SSE error event. Checks writableEnded / destroyed before writing.
+ * Swallows all write errors — never throws.
+ */
 function writeStreamError(res: Response, message: string) {
+  if (res.writableEnded || res.destroyed) return;
   try {
-    const errChunk = {
+    const chunk = {
       id: `chatcmpl-err-${Date.now()}`,
       object: "chat.completion.chunk",
       created: Math.floor(Date.now() / 1000),
@@ -76,9 +80,16 @@ function writeStreamError(res: Response, message: string) {
       choices: [{ index: 0, delta: {}, finish_reason: "stop", logprobs: null }],
       error: { message, type: "api_error" },
     };
-    res.write(`data: ${JSON.stringify(errChunk)}\n\n`);
+    res.write(`data: ${JSON.stringify(chunk)}\n\n`);
     res.write("data: [DONE]\n\n");
-  } catch { /* ignore write errors on a closed socket */ }
+  } catch { /* socket already gone */ }
+}
+
+/** Safely end the response — only if not already ended. */
+function safeEnd(res: Response) {
+  if (!res.writableEnded && !res.destroyed) {
+    try { res.end(); } catch { /* ignore */ }
+  }
 }
 
 // ── Tool format converters ───────────────────────────────────────────────────
@@ -159,7 +170,10 @@ function oaiMessagesToAnthropic(messages: OAIMessage[]): {
     if (msg.role === "assistant") {
       const contentBlocks: unknown[] = [];
       if (msg.content && msg.content !== "") {
-        contentBlocks.push({ type: "text", text: typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content) });
+        contentBlocks.push({
+          type: "text",
+          text: typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content),
+        });
       }
       if (msg.tool_calls) {
         for (const tc of msg.tool_calls) {
@@ -226,10 +240,7 @@ function anthropicToOAIResponse(msg: AnthropicFinalMessage, requestedModel: stri
   }
 
   const finishReason = msg.stop_reason === "tool_use" ? "tool_calls" : "stop";
-  const message: Record<string, unknown> = {
-    role: "assistant",
-    content: textParts.join("") || null,
-  };
+  const message: Record<string, unknown> = { role: "assistant", content: textParts.join("") || null };
   if (toolCalls.length > 0) {
     message.tool_calls = toolCalls;
     message.content = textParts.join("") || null;
@@ -247,10 +258,6 @@ function anthropicToOAIResponse(msg: AnthropicFinalMessage, requestedModel: stri
       total_tokens: msg.usage.input_tokens + msg.usage.output_tokens,
     },
   };
-}
-
-function flush(res: Response) {
-  (res as unknown as { flush?: () => void }).flush?.();
 }
 
 // ── GET /v1/models ───────────────────────────────────────────────────────────
@@ -283,9 +290,7 @@ router.post("/chat/completions", async (req: Request, res: Response) => {
     [key: string]: unknown;
   };
 
-  // Normalize model name — strip provider prefix (e.g. "replit/claude-sonnet-4-6")
-  const rawModel = body.model;
-  const model = normalizeModel(rawModel ?? "");
+  const model = normalizeModel(body.model ?? "");
   const { messages, stream, tools, tool_choice, ...rest } = body;
   delete (rest as Record<string, unknown>).model;
 
@@ -294,175 +299,166 @@ router.post("/chat/completions", async (req: Request, res: Response) => {
     return;
   }
 
-  let streamStarted = false;
+  // ── OpenAI path ──────────────────────────────────────────────────────────
+  if (isOpenAIModel(model)) {
+    const params: Record<string, unknown> = { model, messages, ...rest };
+    if (tools) params.tools = tools;
+    if (tool_choice) params.tool_choice = tool_choice;
 
-  try {
-    // ── OpenAI path ──────────────────────────────────────────────────────────
-    if (isOpenAIModel(model)) {
-      const params: Record<string, unknown> = { model, messages, ...rest };
-      if (tools) params.tools = tools;
-      if (tool_choice) params.tool_choice = tool_choice;
+    if (stream) {
+      res.setHeader("Content-Type", "text/event-stream");
+      res.setHeader("Cache-Control", "no-cache");
+      res.setHeader("Connection", "keep-alive");
+      res.setHeader("X-Accel-Buffering", "no");
+      res.flushHeaders();
 
-      if (stream) {
-        res.setHeader("Content-Type", "text/event-stream");
-        res.setHeader("Cache-Control", "no-cache");
-        res.setHeader("Connection", "keep-alive");
-        res.setHeader("X-Accel-Buffering", "no");
-        res.flushHeaders();
-        streamStarted = true;
+      const keepalive = setInterval(() => {
+        if (!res.writableEnded) try { res.write(": keepalive\n\n"); } catch { /* ignore */ }
+      }, 5000);
 
-        const keepalive = setInterval(() => {
-          try { res.write(": keepalive\n\n"); } catch { /* ignore */ }
-        }, 5000);
+      try {
+        const oaiStream = await openai.chat.completions.create({
+          ...params,
+          stream: true,
+        } as Parameters<typeof openai.chat.completions.create>[0]);
 
-        try {
-          const oaiStream = await openai.chat.completions.create({
-            ...params,
-            stream: true,
-          } as Parameters<typeof openai.chat.completions.create>[0]);
-
-          for await (const chunk of oaiStream) {
-            res.write(`data: ${JSON.stringify(chunk)}\n\n`);
-            flush(res);
-          }
-          res.write("data: [DONE]\n\n");
-        } finally {
-          clearInterval(keepalive);
-          res.end();
+        for await (const chunk of oaiStream) {
+          if (res.writableEnded) break;
+          res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+          flush(res);
         }
-        return;
+        if (!res.writableEnded) res.write("data: [DONE]\n\n");
+      } catch (err) {
+        const e = err as { message?: string };
+        writeStreamError(res, e.message ?? "Stream error");
+      } finally {
+        clearInterval(keepalive);
+        safeEnd(res);
       }
+      return;
+    }
 
+    try {
       const response = await openai.chat.completions.create({
         ...params,
         stream: false,
       } as Parameters<typeof openai.chat.completions.create>[0]);
       res.json(response);
+    } catch (err) {
+      const e = err as { status?: number; message?: string };
+      sendError(res, e.status ?? 500, e.message ?? "OpenAI error");
+    }
+    return;
+  }
+
+  // ── Anthropic path ───────────────────────────────────────────────────────
+  if (isAnthropicModel(model)) {
+    const { system, messages: anthropicMessages } = oaiMessagesToAnthropic(messages);
+    const anthropicParams: Record<string, unknown> = {
+      model,
+      max_tokens: body.max_tokens ?? body.max_completion_tokens ?? 8192,
+      messages: anthropicMessages,
+    };
+    if (system) anthropicParams.system = system;
+    if (tools) anthropicParams.tools = oaiToolsToAnthropic(tools);
+    if (tool_choice) anthropicParams.tool_choice = oaiToolChoiceToAnthropic(tool_choice);
+
+    if (stream) {
+      res.setHeader("Content-Type", "text/event-stream");
+      res.setHeader("Cache-Control", "no-cache");
+      res.setHeader("Connection", "keep-alive");
+      res.setHeader("X-Accel-Buffering", "no");
+      res.flushHeaders();
+
+      const keepalive = setInterval(() => {
+        if (!res.writableEnded) try { res.write(": keepalive\n\n"); } catch { /* ignore */ }
+      }, 5000);
+
+      req.on("close", () => clearInterval(keepalive));
+
+      try {
+        const chatId = `chatcmpl-${Date.now()}`;
+        let toolIndex = -1;
+
+        const sendChunk = (delta: Record<string, unknown>, finishReason: string | null = null) => {
+          if (res.writableEnded) return;
+          const chunk = {
+            id: chatId,
+            object: "chat.completion.chunk",
+            created: Math.floor(Date.now() / 1000),
+            model,
+            choices: [{ index: 0, delta, finish_reason: finishReason, logprobs: null }],
+          };
+          res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+          flush(res);
+        };
+
+        sendChunk({ role: "assistant", content: "" });
+
+        const anthropicStream = anthropic.messages.stream(
+          anthropicParams as Parameters<typeof anthropic.messages.stream>[0],
+        );
+
+        for await (const event of anthropicStream) {
+          if (res.writableEnded) break;
+          const e = event as Record<string, unknown>;
+          const type = e.type as string;
+
+          if (type === "content_block_start") {
+            const block = e.content_block as { type: string; id?: string; name?: string };
+            if (block.type === "tool_use") {
+              toolIndex++;
+              sendChunk({
+                tool_calls: [{
+                  index: toolIndex,
+                  id: block.id ?? "",
+                  type: "function",
+                  function: { name: block.name ?? "", arguments: "" },
+                }],
+              });
+            }
+          } else if (type === "content_block_delta") {
+            const delta = e.delta as { type: string; text?: string; partial_json?: string };
+            if (delta.type === "text_delta" && delta.text) {
+              sendChunk({ content: delta.text });
+            } else if (delta.type === "input_json_delta" && delta.partial_json !== undefined) {
+              sendChunk({
+                tool_calls: [{ index: toolIndex, function: { arguments: delta.partial_json } }],
+              });
+            }
+          } else if (type === "message_delta") {
+            const d = e.delta as { stop_reason?: string };
+            if (d.stop_reason) {
+              sendChunk({}, d.stop_reason === "tool_use" ? "tool_calls" : "stop");
+            }
+          }
+        }
+
+        if (!res.writableEnded) res.write("data: [DONE]\n\n");
+      } catch (err) {
+        const e = err as { message?: string };
+        writeStreamError(res, e.message ?? "Stream error");
+      } finally {
+        clearInterval(keepalive);
+        safeEnd(res);
+      }
       return;
     }
 
-    // ── Anthropic path ───────────────────────────────────────────────────────
-    if (isAnthropicModel(model)) {
-      const { system, messages: anthropicMessages } = oaiMessagesToAnthropic(messages);
-      const anthropicParams: Record<string, unknown> = {
-        model,
-        max_tokens: body.max_tokens ?? body.max_completion_tokens ?? 8192,
-        messages: anthropicMessages,
-      };
-      if (system) anthropicParams.system = system;
-      if (tools) anthropicParams.tools = oaiToolsToAnthropic(tools);
-      if (tool_choice) anthropicParams.tool_choice = oaiToolChoiceToAnthropic(tool_choice);
-
-      if (stream) {
-        res.setHeader("Content-Type", "text/event-stream");
-        res.setHeader("Cache-Control", "no-cache");
-        res.setHeader("Connection", "keep-alive");
-        res.setHeader("X-Accel-Buffering", "no");
-        res.flushHeaders();
-        streamStarted = true;
-
-        const keepalive = setInterval(() => {
-          try { res.write(": keepalive\n\n"); } catch { /* ignore */ }
-        }, 5000);
-
-        req.on("close", () => clearInterval(keepalive));
-
-        try {
-          let currentToolId = "";
-          let currentToolName = "";
-          let toolIndex = -1;
-          let blockIdx = -1;
-          let hasText = false;
-          const chatId = `chatcmpl-${Date.now()}`;
-
-          const sendChunk = (delta: Record<string, unknown>, finishReason: string | null = null) => {
-            const chunk = {
-              id: chatId,
-              object: "chat.completion.chunk",
-              created: Math.floor(Date.now() / 1000),
-              model,
-              choices: [{ index: 0, delta, finish_reason: finishReason, logprobs: null }],
-            };
-            res.write(`data: ${JSON.stringify(chunk)}\n\n`);
-            flush(res);
-          };
-
-          // Send the initial role chunk so clients know content is coming
-          sendChunk({ role: "assistant", content: "" });
-
-          const anthropicStream = anthropic.messages.stream(
-            anthropicParams as Parameters<typeof anthropic.messages.stream>[0],
-          );
-
-          for await (const event of anthropicStream) {
-            const e = event as Record<string, unknown>;
-            const type = e.type as string;
-
-            if (type === "content_block_start") {
-              const block = e.content_block as { type: string; id?: string; name?: string };
-              if (block.type === "text") {
-                blockIdx++;
-                hasText = true;
-              } else if (block.type === "tool_use") {
-                toolIndex++;
-                blockIdx++;
-                currentToolId = block.id ?? "";
-                currentToolName = block.name ?? "";
-                sendChunk({
-                  tool_calls: [{
-                    index: toolIndex,
-                    id: currentToolId,
-                    type: "function",
-                    function: { name: currentToolName, arguments: "" },
-                  }],
-                });
-              }
-            } else if (type === "content_block_delta") {
-              const delta = e.delta as { type: string; text?: string; partial_json?: string };
-              if (delta.type === "text_delta" && delta.text) {
-                sendChunk({ content: delta.text });
-              } else if (delta.type === "input_json_delta" && delta.partial_json !== undefined) {
-                sendChunk({
-                  tool_calls: [{ index: toolIndex, function: { arguments: delta.partial_json } }],
-                });
-              }
-            } else if (type === "message_delta") {
-              const d = e.delta as { stop_reason?: string };
-              if (d.stop_reason) {
-                const finishReason = d.stop_reason === "tool_use" ? "tool_calls" : "stop";
-                sendChunk({}, finishReason);
-              }
-            }
-          }
-
-          void hasText; void currentToolId; void currentToolName; void blockIdx;
-
-          res.write("data: [DONE]\n\n");
-        } finally {
-          clearInterval(keepalive);
-          res.end();
-        }
-        return;
-      }
-
-      // Non-stream: always buffer internally via stream to avoid upstream timeouts
+    // Non-stream: buffer internally via stream() to avoid upstream timeouts
+    try {
       const finalMsg = await anthropic.messages.stream(
         anthropicParams as Parameters<typeof anthropic.messages.stream>[0],
       ).finalMessage();
       res.json(anthropicToOAIResponse(finalMsg as AnthropicFinalMessage, model));
-      return;
+    } catch (err) {
+      const e = err as { status?: number; message?: string };
+      sendError(res, e.status ?? 500, e.message ?? "Anthropic error");
     }
-
-    sendError(res, 400, `Unknown model: ${model}. Supported: ${ALL_MODELS.map((m) => m.id).join(", ")}`, "invalid_request_error");
-  } catch (err: unknown) {
-    const e = err as { status?: number; message?: string };
-    if (streamStarted) {
-      writeStreamError(res, e.message ?? "Internal server error");
-      res.end();
-    } else {
-      sendError(res, e.status ?? 500, e.message ?? "Internal server error");
-    }
+    return;
   }
+
+  sendError(res, 400, `Unknown model: ${model}. Supported: ${ALL_MODELS.map((m) => m.id).join(", ")}`, "invalid_request_error");
 });
 
 // ── POST /v1/messages (Anthropic native) ─────────────────────────────────────
@@ -481,9 +477,7 @@ router.post("/messages", async (req: Request, res: Response) => {
     [key: string]: unknown;
   };
 
-  // Normalize model name
-  const rawModel = body.model;
-  const model = normalizeModel(rawModel ?? "");
+  const model = normalizeModel(body.model ?? "");
   const { messages, system, tools, tool_choice, max_tokens, stream, ...rest } = body;
   delete (rest as Record<string, unknown>).model;
 
@@ -492,238 +486,244 @@ router.post("/messages", async (req: Request, res: Response) => {
     return;
   }
 
-  let streamStarted = false;
+  // ── Claude model — forward to Anthropic ──────────────────────────────────
+  if (isAnthropicModel(model)) {
+    const params: Record<string, unknown> = {
+      model,
+      messages,
+      max_tokens: max_tokens ?? 8192,
+      ...rest,
+    };
+    if (system) params.system = system;
+    if (tools) params.tools = tools;
+    if (tool_choice) params.tool_choice = tool_choice;
 
-  try {
-    // ── Claude model — forward to Anthropic ──────────────────────────────────
-    if (isAnthropicModel(model)) {
-      const params: Record<string, unknown> = {
-        model,
-        messages,
-        max_tokens: max_tokens ?? 8192,
-        ...rest,
-      };
-      if (system) params.system = system;
-      if (tools) params.tools = tools;
-      if (tool_choice) params.tool_choice = tool_choice;
+    if (stream) {
+      res.setHeader("Content-Type", "text/event-stream");
+      res.setHeader("Cache-Control", "no-cache");
+      res.setHeader("Connection", "keep-alive");
+      res.setHeader("X-Accel-Buffering", "no");
+      res.flushHeaders();
 
-      if (stream) {
-        res.setHeader("Content-Type", "text/event-stream");
-        res.setHeader("Cache-Control", "no-cache");
-        res.setHeader("Connection", "keep-alive");
-        res.setHeader("X-Accel-Buffering", "no");
-        res.flushHeaders();
-        streamStarted = true;
+      const keepalive = setInterval(() => {
+        if (!res.writableEnded) try { res.write(": keepalive\n\n"); } catch { /* ignore */ }
+      }, 5000);
+      req.on("close", () => clearInterval(keepalive));
 
-        const keepalive = setInterval(() => {
-          try { res.write(": keepalive\n\n"); } catch { /* ignore */ }
-        }, 5000);
-        req.on("close", () => clearInterval(keepalive));
-
-        try {
-          const anthropicStream = anthropic.messages.stream(
-            params as Parameters<typeof anthropic.messages.stream>[0],
-          );
-          for await (const event of anthropicStream) {
-            const e = event as { type: string };
-            res.write(`event: ${e.type}\ndata: ${JSON.stringify(event)}\n\n`);
-            flush(res);
-          }
-        } finally {
-          clearInterval(keepalive);
-          res.end();
+      try {
+        const anthropicStream = anthropic.messages.stream(
+          params as Parameters<typeof anthropic.messages.stream>[0],
+        );
+        for await (const event of anthropicStream) {
+          if (res.writableEnded) break;
+          const e = event as { type: string };
+          res.write(`event: ${e.type}\ndata: ${JSON.stringify(event)}\n\n`);
+          flush(res);
         }
-        return;
+      } catch (err) {
+        const e = err as { message?: string };
+        if (!res.writableEnded) {
+          try { res.write(`event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "api_error", message: e.message ?? "Stream error" } })}\n\n`); } catch { /* ignore */ }
+        }
+      } finally {
+        clearInterval(keepalive);
+        safeEnd(res);
       }
+      return;
+    }
 
+    try {
       const msg = await anthropic.messages.stream(
         params as Parameters<typeof anthropic.messages.stream>[0],
       ).finalMessage();
       res.json(msg);
+    } catch (err) {
+      const e = err as { status?: number; message?: string };
+      sendError(res, e.status ?? 500, e.message ?? "Anthropic error");
+    }
+    return;
+  }
+
+  // ── OpenAI model via /v1/messages — convert Anthropic → OAI → back ───────
+  if (isOpenAIModel(model)) {
+    const oaiMessages: OAIMessage[] = [];
+    if (system) oaiMessages.push({ role: "system", content: system });
+
+    for (const msg of messages) {
+      if (msg.role === "user") {
+        if (Array.isArray(msg.content)) {
+          const toolResults = (msg.content as Array<{ type: string; tool_use_id?: string; content?: string }>)
+            .filter((b) => b.type === "tool_result");
+          const textBlocks = (msg.content as Array<{ type: string; text?: string }>)
+            .filter((b) => b.type === "text");
+
+          for (const tr of toolResults) {
+            oaiMessages.push({ role: "tool", tool_call_id: tr.tool_use_id ?? "", content: tr.content ?? "" });
+          }
+          if (textBlocks.length > 0) {
+            oaiMessages.push({ role: "user", content: textBlocks.map((b) => b.text).join("") });
+          }
+        } else {
+          oaiMessages.push({ role: "user", content: msg.content as string });
+        }
+      } else if (msg.role === "assistant") {
+        if (Array.isArray(msg.content)) {
+          const textParts = (msg.content as Array<{ type: string; text?: string }>)
+            .filter((b) => b.type === "text").map((b) => b.text).join("");
+          const toolUses = (msg.content as Array<{ type: string; id?: string; name?: string; input?: unknown }>)
+            .filter((b) => b.type === "tool_use");
+          const oaiMsg: OAIMessage = { role: "assistant", content: textParts || null };
+          if (toolUses.length > 0) {
+            oaiMsg.tool_calls = toolUses.map((tu) => ({
+              id: tu.id ?? "",
+              type: "function",
+              function: { name: tu.name ?? "", arguments: JSON.stringify(tu.input ?? {}) },
+            }));
+          }
+          oaiMessages.push(oaiMsg);
+        } else {
+          oaiMessages.push({ role: "assistant", content: msg.content as string });
+        }
+      }
+    }
+
+    const oaiParams: Record<string, unknown> = { model, messages: oaiMessages };
+    if (tools) oaiParams.tools = anthropicToolsToOAI(tools);
+    if (tool_choice) oaiParams.tool_choice = anthropicToolChoiceToOAI(tool_choice);
+    if (max_tokens) oaiParams.max_completion_tokens = max_tokens;
+
+    if (stream) {
+      res.setHeader("Content-Type", "text/event-stream");
+      res.setHeader("Cache-Control", "no-cache");
+      res.setHeader("Connection", "keep-alive");
+      res.setHeader("X-Accel-Buffering", "no");
+      res.flushHeaders();
+
+      const keepalive = setInterval(() => {
+        if (!res.writableEnded) try { res.write(": keepalive\n\n"); } catch { /* ignore */ }
+      }, 5000);
+      req.on("close", () => clearInterval(keepalive));
+
+      const msgId = `msg_${Date.now()}`;
+      let outputTokens = 0;
+
+      const sendEvent = (type: string, data: unknown) => {
+        if (res.writableEnded) return;
+        res.write(`event: ${type}\ndata: ${JSON.stringify(data)}\n\n`);
+        flush(res);
+      };
+
+      try {
+        const oaiStream = await openai.chat.completions.create({
+          ...oaiParams,
+          stream: true,
+        } as Parameters<typeof openai.chat.completions.create>[0]);
+
+        sendEvent("message_start", {
+          type: "message_start",
+          message: {
+            id: msgId,
+            type: "message",
+            role: "assistant",
+            model,
+            content: [],
+            stop_reason: null,
+            stop_sequence: null,
+            usage: { input_tokens: 0, output_tokens: 0 },
+          },
+        });
+
+        let textBlockIdx = -1;
+        const toolBlockIndices: Record<string, number> = {};
+        let blockIdx = -1;
+        let hasText = false;
+
+        for await (const chunk of oaiStream) {
+          if (res.writableEnded) break;
+          const delta = chunk.choices[0]?.delta;
+          if (!delta) continue;
+
+          if (delta.content) {
+            if (!hasText) {
+              hasText = true;
+              blockIdx++;
+              textBlockIdx = blockIdx;
+              sendEvent("content_block_start", {
+                type: "content_block_start",
+                index: textBlockIdx,
+                content_block: { type: "text", text: "" },
+              });
+              sendEvent("ping", { type: "ping" });
+            }
+            sendEvent("content_block_delta", {
+              type: "content_block_delta",
+              index: textBlockIdx,
+              delta: { type: "text_delta", text: delta.content },
+            });
+            outputTokens++;
+          }
+
+          if (delta.tool_calls) {
+            for (const tc of delta.tool_calls) {
+              const tcId = tc.id ?? "";
+              if (tcId && !(tcId in toolBlockIndices)) {
+                blockIdx++;
+                toolBlockIndices[tcId] = blockIdx;
+                sendEvent("content_block_start", {
+                  type: "content_block_start",
+                  index: blockIdx,
+                  content_block: { type: "tool_use", id: tcId, name: tc.function?.name ?? "", input: {} },
+                });
+              }
+              const idx = tc.id
+                ? toolBlockIndices[tc.id]
+                : Object.values(toolBlockIndices).at(-1) ?? blockIdx;
+              if (tc.function?.arguments) {
+                sendEvent("content_block_delta", {
+                  type: "content_block_delta",
+                  index: idx,
+                  delta: { type: "input_json_delta", partial_json: tc.function.arguments },
+                });
+              }
+            }
+          }
+
+          if (chunk.choices[0]?.finish_reason) {
+            if (hasText) sendEvent("content_block_stop", { type: "content_block_stop", index: textBlockIdx });
+            for (const [, i] of Object.entries(toolBlockIndices)) {
+              sendEvent("content_block_stop", { type: "content_block_stop", index: i });
+            }
+            const stopReason = chunk.choices[0].finish_reason === "tool_calls" ? "tool_use" : "end_turn";
+            sendEvent("message_delta", {
+              type: "message_delta",
+              delta: { stop_reason: stopReason, stop_sequence: null },
+              usage: { output_tokens: outputTokens },
+            });
+            sendEvent("message_stop", { type: "message_stop" });
+          }
+
+          if (chunk.usage) outputTokens = chunk.usage.completion_tokens ?? 0;
+        }
+      } catch (err) {
+        const e = err as { message?: string };
+        if (!res.writableEnded) {
+          try { res.write(`event: error\ndata: ${JSON.stringify({ type: "error", error: { type: "api_error", message: e.message ?? "Stream error" } })}\n\n`); } catch { /* ignore */ }
+        }
+      } finally {
+        clearInterval(keepalive);
+        safeEnd(res);
+      }
       return;
     }
 
-    // ── OpenAI model — convert Anthropic → OAI → back ───────────────────────
-    if (isOpenAIModel(model)) {
-      const oaiMessages: OAIMessage[] = [];
-      if (system) oaiMessages.push({ role: "system", content: system });
-
-      for (const msg of messages) {
-        if (msg.role === "user") {
-          if (Array.isArray(msg.content)) {
-            const toolResults = (msg.content as Array<{ type: string; tool_use_id?: string; content?: string }>)
-              .filter((b) => b.type === "tool_result");
-            const textBlocks = (msg.content as Array<{ type: string; text?: string }>)
-              .filter((b) => b.type === "text");
-
-            for (const tr of toolResults) {
-              oaiMessages.push({ role: "tool", tool_call_id: tr.tool_use_id ?? "", content: tr.content ?? "" });
-            }
-            if (textBlocks.length > 0) {
-              oaiMessages.push({ role: "user", content: textBlocks.map((b) => b.text).join("") });
-            }
-          } else {
-            oaiMessages.push({ role: "user", content: msg.content as string });
-          }
-        } else if (msg.role === "assistant") {
-          if (Array.isArray(msg.content)) {
-            const textParts = (msg.content as Array<{ type: string; text?: string }>)
-              .filter((b) => b.type === "text").map((b) => b.text).join("");
-            const toolUses = (msg.content as Array<{ type: string; id?: string; name?: string; input?: unknown }>)
-              .filter((b) => b.type === "tool_use");
-            const oaiMsg: OAIMessage = { role: "assistant", content: textParts || null };
-            if (toolUses.length > 0) {
-              oaiMsg.tool_calls = toolUses.map((tu) => ({
-                id: tu.id ?? "",
-                type: "function",
-                function: { name: tu.name ?? "", arguments: JSON.stringify(tu.input ?? {}) },
-              }));
-            }
-            oaiMessages.push(oaiMsg);
-          } else {
-            oaiMessages.push({ role: "assistant", content: msg.content as string });
-          }
-        }
-      }
-
-      const oaiParams: Record<string, unknown> = { model, messages: oaiMessages };
-      if (tools) oaiParams.tools = anthropicToolsToOAI(tools);
-      if (tool_choice) oaiParams.tool_choice = anthropicToolChoiceToOAI(tool_choice);
-      if (max_tokens) oaiParams.max_completion_tokens = max_tokens;
-
-      if (stream) {
-        res.setHeader("Content-Type", "text/event-stream");
-        res.setHeader("Cache-Control", "no-cache");
-        res.setHeader("Connection", "keep-alive");
-        res.setHeader("X-Accel-Buffering", "no");
-        res.flushHeaders();
-        streamStarted = true;
-
-        const keepalive = setInterval(() => {
-          try { res.write(": keepalive\n\n"); } catch { /* ignore */ }
-        }, 5000);
-        req.on("close", () => clearInterval(keepalive));
-
-        const msgId = `msg_${Date.now()}`;
-        let outputTokens = 0;
-
-        const sendEvent = (type: string, data: unknown) => {
-          res.write(`event: ${type}\ndata: ${JSON.stringify(data)}\n\n`);
-          flush(res);
-        };
-
-        try {
-          const oaiStream = await openai.chat.completions.create({
-            ...oaiParams,
-            stream: true,
-          } as Parameters<typeof openai.chat.completions.create>[0]);
-
-          sendEvent("message_start", {
-            type: "message_start",
-            message: {
-              id: msgId,
-              type: "message",
-              role: "assistant",
-              model,
-              content: [],
-              stop_reason: null,
-              stop_sequence: null,
-              usage: { input_tokens: 0, output_tokens: 0 },
-            },
-          });
-
-          let textBlockIdx = -1;
-          const toolBlockIndices: Record<string, number> = {};
-          let blockIdx = -1;
-          let hasText = false;
-
-          for await (const chunk of oaiStream) {
-            const delta = chunk.choices[0]?.delta;
-            if (!delta) continue;
-
-            if (delta.content) {
-              if (!hasText) {
-                hasText = true;
-                blockIdx++;
-                textBlockIdx = blockIdx;
-                sendEvent("content_block_start", {
-                  type: "content_block_start",
-                  index: textBlockIdx,
-                  content_block: { type: "text", text: "" },
-                });
-                sendEvent("ping", { type: "ping" });
-              }
-              sendEvent("content_block_delta", {
-                type: "content_block_delta",
-                index: textBlockIdx,
-                delta: { type: "text_delta", text: delta.content },
-              });
-              outputTokens++;
-            }
-
-            if (delta.tool_calls) {
-              for (const tc of delta.tool_calls) {
-                const tcId = tc.id ?? "";
-                if (tcId && !(tcId in toolBlockIndices)) {
-                  blockIdx++;
-                  toolBlockIndices[tcId] = blockIdx;
-                  sendEvent("content_block_start", {
-                    type: "content_block_start",
-                    index: blockIdx,
-                    content_block: { type: "tool_use", id: tcId, name: tc.function?.name ?? "", input: {} },
-                  });
-                }
-                const idx = tc.id
-                  ? toolBlockIndices[tc.id]
-                  : Object.values(toolBlockIndices).at(-1) ?? blockIdx;
-                if (tc.function?.arguments) {
-                  sendEvent("content_block_delta", {
-                    type: "content_block_delta",
-                    index: idx,
-                    delta: { type: "input_json_delta", partial_json: tc.function.arguments },
-                  });
-                }
-              }
-            }
-
-            if (chunk.choices[0]?.finish_reason) {
-              if (hasText) {
-                sendEvent("content_block_stop", { type: "content_block_stop", index: textBlockIdx });
-              }
-              for (const [, i] of Object.entries(toolBlockIndices)) {
-                sendEvent("content_block_stop", { type: "content_block_stop", index: i });
-              }
-              const stopReason = chunk.choices[0].finish_reason === "tool_calls" ? "tool_use" : "end_turn";
-              sendEvent("message_delta", {
-                type: "message_delta",
-                delta: { stop_reason: stopReason, stop_sequence: null },
-                usage: { output_tokens: outputTokens },
-              });
-              sendEvent("message_stop", { type: "message_stop" });
-            }
-
-            if (chunk.usage) {
-              outputTokens = chunk.usage.completion_tokens ?? 0;
-            }
-          }
-
-          void hasText;
-        } finally {
-          clearInterval(keepalive);
-          res.end();
-        }
-        return;
-      }
-
-      // Non-stream OAI
+    // Non-stream OAI → Anthropic format
+    try {
       const oaiResponse = await openai.chat.completions.create(
         oaiParams as Parameters<typeof openai.chat.completions.create>[0],
       );
       const choice = oaiResponse.choices[0];
       const contentBlocks: unknown[] = [];
-      if (choice?.message?.content) {
-        contentBlocks.push({ type: "text", text: choice.message.content });
-      }
+      if (choice?.message?.content) contentBlocks.push({ type: "text", text: choice.message.content });
       if (choice?.message?.tool_calls) {
         for (const tc of choice.message.tool_calls) {
           let input: unknown = {};
@@ -731,33 +731,27 @@ router.post("/messages", async (req: Request, res: Response) => {
           contentBlocks.push({ type: "tool_use", id: tc.id, name: tc.function.name, input });
         }
       }
-      const stopReason = choice?.finish_reason === "tool_calls" ? "tool_use" : "end_turn";
       res.json({
         id: `msg_${oaiResponse.id}`,
         type: "message",
         role: "assistant",
         model,
         content: contentBlocks,
-        stop_reason: stopReason,
+        stop_reason: choice?.finish_reason === "tool_calls" ? "tool_use" : "end_turn",
         stop_sequence: null,
         usage: {
           input_tokens: oaiResponse.usage?.prompt_tokens ?? 0,
           output_tokens: oaiResponse.usage?.completion_tokens ?? 0,
         },
       });
-      return;
+    } catch (err) {
+      const e = err as { status?: number; message?: string };
+      sendError(res, e.status ?? 500, e.message ?? "OpenAI error");
     }
-
-    sendError(res, 400, `Unknown model: ${model}. Supported: ${ALL_MODELS.map((m) => m.id).join(", ")}`, "invalid_request_error");
-  } catch (err: unknown) {
-    const e = err as { status?: number; message?: string };
-    if (streamStarted) {
-      writeStreamError(res, e.message ?? "Internal server error");
-      res.end();
-    } else {
-      sendError(res, e.status ?? 500, e.message ?? "Internal server error");
-    }
+    return;
   }
+
+  sendError(res, 400, `Unknown model: ${model}. Supported: ${ALL_MODELS.map((m) => m.id).join(", ")}`, "invalid_request_error");
 });
 
 export default router;
