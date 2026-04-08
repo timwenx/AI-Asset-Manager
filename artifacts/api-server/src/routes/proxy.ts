@@ -33,8 +33,15 @@ const ALL_MODELS = [...OPENAI_MODELS, ...ANTHROPIC_MODELS];
 
 function verifyBearer(req: Request, res: Response): boolean {
   const proxyKey = process.env.PROXY_API_KEY;
-  const auth = req.headers["authorization"];
-  if (!proxyKey || !auth || auth !== `Bearer ${proxyKey}`) {
+  if (!proxyKey) {
+    res.status(500).json({ error: { message: "PROXY_API_KEY not configured", type: "api_error", code: 500 } });
+    return false;
+  }
+  const authHeader = req.headers["authorization"];
+  const xApiKey = req.headers["x-api-key"];
+  const validBearer = authHeader === `Bearer ${proxyKey}`;
+  const validApiKey = xApiKey === proxyKey;
+  if (!validBearer && !validApiKey) {
     res.status(401).json({ error: { message: "Unauthorized", type: "authentication_error", code: 401 } });
     return false;
   }

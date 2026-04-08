@@ -251,7 +251,7 @@ export default function App() {
                 </div>
               </div>
               <div>
-                <div style={{ fontSize: 12, color: MUTED, marginBottom: 6, fontWeight: 500 }}>Authorization Header</div>
+                <div style={{ fontSize: 12, color: MUTED, marginBottom: 6, fontWeight: 500 }}>Authentication — OpenAI-style clients</div>
                 <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
                   <code style={{
                     flex: 1, background: "hsl(222,47%,10%)", border: `1px solid ${BORDER}`,
@@ -259,8 +259,18 @@ export default function App() {
                   }}>{authHeader}</code>
                   <CopyBtn id="authheader" text={authHeader} copied={copied} copy={copy} />
                 </div>
+              </div>
+              <div>
+                <div style={{ fontSize: 12, color: MUTED, marginBottom: 6, fontWeight: 500 }}>Authentication — Anthropic-style clients (x-api-key)</div>
+                <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                  <code style={{
+                    flex: 1, background: "hsl(222,47%,10%)", border: `1px solid ${BORDER}`,
+                    borderRadius: 6, padding: "8px 12px", fontSize: 13, color: "#C4B5FD",
+                  }}>x-api-key: YOUR_PROXY_API_KEY</code>
+                  <CopyBtn id="xapikey" text="x-api-key: YOUR_PROXY_API_KEY" copied={copied} copy={copy} />
+                </div>
                 <div style={{ fontSize: 12, color: MUTED, marginTop: 6 }}>
-                  Replace <code style={{ color: "#FCD34D" }}>YOUR_PROXY_API_KEY</code> with the value of your <code style={{ color: "#FCD34D" }}>PROXY_API_KEY</code> secret.
+                  Both formats are accepted. Use <code style={{ color: "#FCD34D" }}>x-api-key</code> when configuring Anthropic SDK clients (e.g. VSCode extensions using Anthropic provider type). Use <code style={{ color: "#FCD34D" }}>Authorization: Bearer</code> for OpenAI-compatible clients.
                 </div>
               </div>
             </div>
