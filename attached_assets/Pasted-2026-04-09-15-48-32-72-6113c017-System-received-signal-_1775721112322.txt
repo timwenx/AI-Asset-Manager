@@ -1,0 +1,73 @@
+2026-04-09 15:48:32.72
+6113c017
+System
+received signal, shutting down artifact processes signal=terminated
+
+2026-04-09 15:48:32.72
+6113c017
+System
+sending SIGTERM to artifact process artifact=artifacts/api-server
+2026-04-09 15:48:32.72
+6113c017
+System
+artifact process exited with error error=signal: terminated artifact=artifacts/api-server
+2026-04-09 15:48:32.72
+6113c017
+System
+main done, exiting
+2026-04-09 15:48:32.72
+6113c017
+System
+all artifact processes stopped
+2026-04-09 15:50:23.26
+89bec027
+System
+received signal, shutting down artifact processes signal=terminated
+2026-04-09 15:50:23.26
+89bec027
+System
+sending SIGTERM to artifact process artifact=artifacts/api-server
+2026-04-09 15:50:23.27
+89bec027
+System
+artifact process exited with error error=signal: terminated artifact=artifacts/api-server
+2026-04-09 15:50:23.27
+89bec027
+System
+main done, exiting
+2026-04-09 15:50:23.27
+89bec027
+System
+all artifact processes stopped
+2026-04-09 15:51:35.52
+6113c017
+User
+{"level":30,"time":1775721095524,"pid":19,"hostname":"localhost","role":"user","merged":2,"from":2,"msg":"mergeConsecutiveMessages: merged run"}
+2026-04-09 15:51:35.53
+6113c017
+User
+(node:19) [DEP0169] DeprecationWarning: `url.parse()` behavior is not standardized and prone to errors that have security implications. Use the WHATWG URL API instead. CVEs are not issued for `url.parse()` vulnerabilities.
+2026-04-09 15:51:35.53
+6113c017
+User
+{"level":30,"time":1775721095524,"pid":19,"hostname":"localhost","role":"user","merged":17,"from":17,"msg":"mergeConsecutiveMessages: merged run"}
+2026-04-09 15:51:35.53
+6113c017
+User
+{"level":40,"time":1775721095524,"pid":19,"hostname":"localhost","missingIds":["toolu_vrtx_01HsKJs1Ak5GzgF9Z6KprG7b"],"hasNext":true,"nextRole":"user","msg":"repairToolResults: injecting synthetic tool_results"}
+2026-04-09 15:51:35.53
+6113c017
+User
+{"level":30,"time":1775721095524,"pid":19,"hostname":"localhost","role":"user","merged":17,"from":17,"msg":"mergeConsecutiveMessages: merged run"}
+2026-04-09 15:51:35.53
+6113c017
+User
+{"level":30,"time":1775721095524,"pid":19,"hostname":"localhost","model":"claude-opus-4-6","stream":true,"endpoint":"messages","msgs":["[0]user:text(<user_info>\nOS Versi)","[1]user:text(<user_query>\n我需要写一份关)","[2]assistant:tool_use(ek3vkb),text","[3]user:tool_result(ek3vkb)","[4]user:text(<user_query>\n我需要写一份关)","[5]user:text(<user_query>\n我需要写一份关)","[6]user:text(<user_query>\n我需要写一份关)","[7]user:text(<user_query>\n我需要写一份关)","[8]user:text(<user_query>\n我需要写一份关)","[9]user:text(<user_query>\n我需要写一份关)","[10]user:text(<user_query>\n我需要写一份关)","[11]user:text(<user_query>\n我需要写一份关)","[12]user:text(<user_query>\n我需要写一份关)","[13]user:text(<user_query>\n我需要写一份关)","[14]user:text(<user_query>\n我需要写一份关)","[15]user:text(<user_query>\n我需要写一份关)","[16]user:text(<user_query>\n我需要写一份关)","[17]user:text(<user_query>\n我需要写一份关)","[18]user:text(<user_query>\n我需要写一份关)","[19]user:tool_result(KprG7b)","[20]assistant:tool_use(KprG7b)","[21]user:text(<user_query>\n我需要写一份关)","[22]user:text(<user_query>\n我需要写一份关)","[23]user:text(<user_query>\n我需要写一份关)","[24]user:text(<user_query>\n我需要写一份关)","[25]user:text(<user_query>\n我需要写一份关)","[26]user:text(<user_query>\n我需要写一份关)","[27]user:text(<user_query>\n我需要写一份关)","[28]user:text(<user_query>\n我需要写一份关)","[29]user:text(<user_query>\n我需要写一份关)","[30]user:text(<user_query>\n我需要写一份关)","[31]user:text(<user_query>\n我需要写一份关)","[32]user:text(<user_query>\n我需要写一份关)","[33]user:text(<user_query>\n我需要写一份关)","[34]user:text(<user_query>\n我需要写一份关)","[35]user:text(<user_query>\n我需要写一份关)","[36]user:text(<user_query>\n我需要写一份关)","[37]user:text(<user_query>\n我需要写一份关)"],"repaired":["[0]user:text,text","[1]assistant:text,tool_use(ek3vkb)","[2]user:tool_result(ek3vkb),tool_result(KprG7b),text,text,text,text,text,text,text,text,text,text,text,text,text,text,text","[3]assistant:tool_use(KprG7b)","[4]user:tool_result(KprG7b),text,text,text,text,text,text,text,text,text,text,text,text,text,text,text,text,text"],"msg":"proxy request"}
+2026-04-09 15:51:36.96
+6113c017
+User
+{"level":50,"time":1775721096964,"pid":19,"hostname":"localhost","model":"claude-opus-4-6","status":400,"upstream":"400 {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"messages.2.content.1: unexpected `tool_use_id` found in `tool_result` blocks: toolu_vrtx_01HsKJs1Ak5GzgF9Z6KprG7b. Each `tool_result` block must have a corresponding `tool_use` block in the previous message.\"},\"request_id\":\"req_vrtx_011CZsqHjXt4G91DFciKmuP7\"}null","msg":"anthropic stream error"}
+2026-04-09 15:51:36.96
+6113c017
+User
+{"level":30,"time":1775721096964,"pid":19,"hostname":"localhost","req":{"id":4,"method":"POST","url":"/v1/messages"},"res":{"statusCode":200},"responseTime":1446,"msg":"request completed"}
