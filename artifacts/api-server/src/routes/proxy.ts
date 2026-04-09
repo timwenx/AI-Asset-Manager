@@ -159,6 +159,60 @@ function anthropicToolChoiceToOAI(tc: AnthropicToolChoice): OAIToolChoice {
   return "auto";
 }
 
+// ── Anthropic message repair ─────────────────────────────────────────────────
+
+/**
+ * Anthropic requires that every `tool_use` block in an assistant message is
+ * immediately followed by a user message containing a `tool_result` block for
+ * each `tool_use` id.  Clients (especially IDE extensions) often omit these
+ * when the user continues a conversation without waiting for tool execution.
+ * This function scans the messages array and injects synthetic empty
+ * `tool_result` blocks wherever they are missing so Anthropic accepts the request.
+ */
+function repairToolResults(messages: AnthropicMessage[]): AnthropicMessage[] {
+  type Block = { type: string; id?: string; tool_use_id?: string; [k: string]: unknown };
+
+  const result: AnthropicMessage[] = [];
+  let i = 0;
+
+  while (i < messages.length) {
+    const msg = messages[i];
+    result.push(msg);
+    i++;
+
+    if (msg.role !== "assistant") continue;
+    const blocks = Array.isArray(msg.content) ? (msg.content as Block[]) : [];
+    const toolUseIds = blocks.filter((b) => b.type === "tool_use" && b.id).map((b) => b.id as string);
+    if (toolUseIds.length === 0) continue;
+
+    // Find which ids already have a tool_result in the next user message
+    const next = messages[i];
+    const nextBlocks: Block[] = Array.isArray(next?.content) ? (next.content as Block[]) : [];
+    const coveredIds = new Set(
+      nextBlocks.filter((b) => b.type === "tool_result" && b.tool_use_id).map((b) => b.tool_use_id as string),
+    );
+    const missingIds = toolUseIds.filter((id) => !coveredIds.has(id));
+    if (missingIds.length === 0) continue;
+
+    const syntheticResults: Block[] = missingIds.map((id) => ({
+      type: "tool_result",
+      tool_use_id: id,
+      content: "",
+    }));
+
+    if (next?.role === "user") {
+      // Prepend synthetic results to the existing user message and skip it
+      result.push({ role: "user", content: [...syntheticResults, ...nextBlocks] } as AnthropicMessage);
+      i++; // consume the original next message
+    } else {
+      // No following user message — inject a synthetic one
+      result.push({ role: "user", content: syntheticResults } as AnthropicMessage);
+    }
+  }
+
+  return result;
+}
+
 // ── Message converters (OAI → Anthropic) ────────────────────────────────────
 
 type OAIMessage = {
@@ -379,7 +433,7 @@ router.post("/chat/completions", async (req: Request, res: Response) => {
     const anthropicParams: Record<string, unknown> = {
       model,
       max_tokens: body.max_tokens ?? body.max_completion_tokens ?? 8192,
-      messages: anthropicMessages,
+      messages: repairToolResults(anthropicMessages),
     };
     if (system) anthropicParams.system = system;
     if (tools) anthropicParams.tools = oaiToolsToAnthropic(tools);
@@ -514,7 +568,7 @@ router.post("/messages", async (req: Request, res: Response) => {
   if (isAnthropicModel(model)) {
     const params: Record<string, unknown> = {
       model,
-      messages,
+      messages: repairToolResults(messages),
       max_tokens: max_tokens ?? 8192,
       ...rest,
     };
