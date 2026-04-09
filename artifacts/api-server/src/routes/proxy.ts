@@ -114,12 +114,23 @@ type AnthropicTool = {
   input_schema: Record<string, unknown>;
 };
 
+/** Sanitize a tool name to match Anthropic's pattern ^[a-zA-Z0-9_-]{1,128}$ */
+function sanitizeToolName(name: string): string {
+  const sanitized = (name ?? "tool").replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 128);
+  return sanitized.length > 0 ? sanitized : "tool";
+}
+
 function oaiToolsToAnthropic(tools: OAITool[]): AnthropicTool[] {
   return tools.map((t) => ({
-    name: t.function.name,
+    name: sanitizeToolName(t.function.name),
     description: t.function.description,
     input_schema: (t.function.parameters as Record<string, unknown>) ?? { type: "object", properties: {} },
   }));
+}
+
+/** Sanitize all tool names in an Anthropic-format tools array */
+function sanitizeAnthropicTools(tools: AnthropicTool[]): AnthropicTool[] {
+  return tools.map((t) => ({ ...t, name: sanitizeToolName(t.name) }));
 }
 
 function anthropicToolsToOAI(tools: AnthropicTool[]): OAITool[] {
@@ -508,8 +519,8 @@ router.post("/messages", async (req: Request, res: Response) => {
       ...rest,
     };
     if (system) params.system = system;
-    if (tools) params.tools = tools;
-    if (tool_choice) params.tool_choice = tool_choice;
+    if (tools) params.tools = sanitizeAnthropicTools(tools);
+    if (tool_choice) params.tool_choice = tool_choice?.name ? { ...tool_choice, name: sanitizeToolName(tool_choice.name) } : tool_choice;
 
     if (stream) {
       res.setHeader("Content-Type", "text/event-stream");
