@@ -172,6 +172,13 @@ function anthropicToolChoiceToOAI(tc: AnthropicToolChoice): OAIToolChoice {
 function repairToolResults(messages: AnthropicMessage[]): AnthropicMessage[] {
   type Block = { type: string; id?: string; tool_use_id?: string; [k: string]: unknown };
 
+  /** Normalise content to an array of blocks so we can prepend tool_results */
+  function toBlocks(content: unknown): Block[] {
+    if (Array.isArray(content)) return content as Block[];
+    if (typeof content === "string" && content) return [{ type: "text", text: content }];
+    return [];
+  }
+
   const result: AnthropicMessage[] = [];
   let i = 0;
 
@@ -187,7 +194,7 @@ function repairToolResults(messages: AnthropicMessage[]): AnthropicMessage[] {
 
     // Find which ids already have a tool_result in the next user message
     const next = messages[i];
-    const nextBlocks: Block[] = Array.isArray(next?.content) ? (next.content as Block[]) : [];
+    const nextBlocks: Block[] = toBlocks(next?.content);
     const coveredIds = new Set(
       nextBlocks.filter((b) => b.type === "tool_result" && b.tool_use_id).map((b) => b.tool_use_id as string),
     );
@@ -200,8 +207,10 @@ function repairToolResults(messages: AnthropicMessage[]): AnthropicMessage[] {
       content: "",
     }));
 
+    logger.warn({ missingIds, hasNext: !!next, nextRole: next?.role }, "repairToolResults: injecting synthetic tool_results");
+
     if (next?.role === "user") {
-      // Prepend synthetic results to the existing user message and skip it
+      // Prepend synthetic results to the existing user message (preserving string content as text block)
       result.push({ role: "user", content: [...syntheticResults, ...nextBlocks] } as AnthropicMessage);
       i++; // consume the original next message
     } else {
@@ -562,13 +571,25 @@ router.post("/messages", async (req: Request, res: Response) => {
     return;
   }
 
-  logger.info({ model, stream: body.stream, endpoint: "messages" }, "proxy request");
+  /** Compact summary of messages array for logging */
+  function msgSummary(msgs: AnthropicMessage[]) {
+    return (msgs ?? []).map((m, idx) => {
+      const blocks = Array.isArray(m.content) ? (m.content as Array<{ type: string; id?: string; tool_use_id?: string }>) : [];
+      const types = Array.isArray(m.content)
+        ? blocks.map((b) => b.type + (b.id ? `(${b.id.slice(-6)})` : b.tool_use_id ? `(${b.tool_use_id.slice(-6)})` : "")).join(",")
+        : typeof m.content === "string" ? `text(${m.content.slice(0, 20)})` : "?";
+      return `[${idx}]${m.role}:${types}`;
+    });
+  }
+
+  const repairedMessages = repairToolResults(messages ?? []);
+  logger.info({ model, stream: body.stream, endpoint: "messages", msgs: msgSummary(messages ?? []), repaired: msgSummary(repairedMessages) }, "proxy request");
 
   // ── Claude model — forward to Anthropic ──────────────────────────────────
   if (isAnthropicModel(model)) {
     const params: Record<string, unknown> = {
       model,
-      messages: repairToolResults(messages),
+      messages: repairedMessages,
       max_tokens: max_tokens ?? 8192,
       ...rest,
     };
