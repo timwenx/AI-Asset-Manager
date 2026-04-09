@@ -159,6 +159,80 @@ function anthropicToolChoiceToOAI(tc: AnthropicToolChoice): OAIToolChoice {
   return "auto";
 }
 
+// ── Anthropic message normalisation ──────────────────────────────────────────
+
+/**
+ * Vertex AI (used by Replit's Anthropic integration) requires that in every
+ * assistant message, `text` blocks appear BEFORE `tool_use` blocks.  When the
+ * order is reversed the API returns a spurious
+ * "tool_use ids found without tool_result" 400 error even when a correct
+ * tool_result exists in the next user message.
+ *
+ * Reorder assistant content so:  text* → tool_use*
+ */
+function fixAssistantBlockOrder(messages: AnthropicMessage[]): AnthropicMessage[] {
+  return (messages ?? []).map((msg) => {
+    if (msg.role !== "assistant" || !Array.isArray(msg.content)) return msg;
+    type Block = { type: string; [k: string]: unknown };
+    const blocks = msg.content as Block[];
+    const hasText = blocks.some((b) => b.type === "text");
+    const hasToolUse = blocks.some((b) => b.type === "tool_use");
+    if (!hasText || !hasToolUse) return msg; // nothing to reorder
+    const texts = blocks.filter((b) => b.type === "text");
+    const toolUses = blocks.filter((b) => b.type === "tool_use");
+    const others = blocks.filter((b) => b.type !== "text" && b.type !== "tool_use");
+    return { ...msg, content: [...texts, ...toolUses, ...others] } as AnthropicMessage;
+  });
+}
+
+
+/**
+ * Anthropic requires strictly alternating user/assistant turns.
+ * Merge any run of consecutive same-role messages into a single message,
+ * combining their content blocks.  String content is converted to a text block
+ * so we can safely spread everything into one array.
+ */
+function mergeConsecutiveMessages(messages: AnthropicMessage[]): AnthropicMessage[] {
+  if (!messages?.length) return messages ?? [];
+
+  type Block = { type: string; [k: string]: unknown };
+
+  function toBlocks(content: unknown): Block[] {
+    if (Array.isArray(content)) return content as Block[];
+    if (typeof content === "string" && content) return [{ type: "text", text: content }];
+    return [];
+  }
+
+  const result: AnthropicMessage[] = [];
+  let i = 0;
+
+  while (i < messages.length) {
+    const role = messages[i].role;
+    const run: AnthropicMessage[] = [];
+
+    while (i < messages.length && messages[i].role === role) {
+      run.push(messages[i]);
+      i++;
+    }
+
+    if (run.length === 1) {
+      result.push(run[0]);
+    } else {
+      // For tool_result ordering: tool_result blocks MUST come before text blocks
+      // when following an assistant tool_use.  Sort each merged user message so
+      // tool_result blocks appear first.
+      const allBlocks = run.flatMap((m) => toBlocks(m.content));
+      const toolResults = allBlocks.filter((b) => b.type === "tool_result");
+      const others = allBlocks.filter((b) => b.type !== "tool_result");
+      const merged = [...toolResults, ...others];
+      result.push({ role, content: merged.length === 1 && typeof run[0].content === "string" ? (merged[0] as { text: string }).text : merged } as AnthropicMessage);
+      logger.info({ role, merged: merged.length, from: run.length }, "mergeConsecutiveMessages: merged run");
+    }
+  }
+
+  return result;
+}
+
 // ── Anthropic message repair ─────────────────────────────────────────────────
 
 /**
@@ -442,7 +516,7 @@ router.post("/chat/completions", async (req: Request, res: Response) => {
     const anthropicParams: Record<string, unknown> = {
       model,
       max_tokens: body.max_tokens ?? body.max_completion_tokens ?? 8192,
-      messages: repairToolResults(anthropicMessages),
+      messages: repairToolResults(mergeConsecutiveMessages(fixAssistantBlockOrder(anthropicMessages))),
     };
     if (system) anthropicParams.system = system;
     if (tools) anthropicParams.tools = oaiToolsToAnthropic(tools);
@@ -582,14 +656,14 @@ router.post("/messages", async (req: Request, res: Response) => {
     });
   }
 
-  const repairedMessages = repairToolResults(messages ?? []);
-  logger.info({ model, stream: body.stream, endpoint: "messages", msgs: msgSummary(messages ?? []), repaired: msgSummary(repairedMessages) }, "proxy request");
+  const normalizedMessages = repairToolResults(mergeConsecutiveMessages(fixAssistantBlockOrder(messages ?? [])));
+  logger.info({ model, stream: body.stream, endpoint: "messages", msgs: msgSummary(messages ?? []), repaired: msgSummary(normalizedMessages) }, "proxy request");
 
   // ── Claude model — forward to Anthropic ──────────────────────────────────
   if (isAnthropicModel(model)) {
     const params: Record<string, unknown> = {
       model,
-      messages: repairedMessages,
+      messages: normalizedMessages,
       max_tokens: max_tokens ?? 8192,
       ...rest,
     };
